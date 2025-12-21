@@ -1,6 +1,62 @@
-[package]
-name = "p2p-edge"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+    "crates/edge-bootstrap",
+]
+# Explicitly set the resolver as recommended after Rust 2021
+resolver = "2"
 
-[dependencies]
+
+# ─────────────────────────────────────────────
+# Unified dependency versions (critical)
+# ─────────────────────────────────────────────
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "signal"] }
+
+# HTTP / API
+axum = "0.7"
+
+# serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# crypto / identity
+ed25519-dalek = "2"
+rand = "0.8"
+
+# time / expiry
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# config
+config = "0.14"
+
+
+# ─────────────────────────────────────────────
+# Workspace lint / build policy (recommended)
+# ─────────────────────────────────────────────
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+
+
+# ─────────────────────────────────────────────
+# Optional: unified profile (well-suited for network elements/services)
+# ─────────────────────────────────────────────
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
