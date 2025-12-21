@@ -20,6 +20,10 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 hyper = "1"
 tower = "0.5"
+rusqlite = { version = "0.31", features = ["bundled", "time"] }
+tempfile = "3.10"
+subtle = "2.5"
+rand = { workspace = true }
 
 [dev-dependencies]
 lazy_static = "1.4"

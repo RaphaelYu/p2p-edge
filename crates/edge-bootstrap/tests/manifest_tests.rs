@@ -1,14 +1,25 @@
-use axum::{body::{Body, to_bytes}, http::Request};
+use axum::{
+    body::{Body, to_bytes},
+    http::Request,
+};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use ed25519_dalek::{Signature, Verifier};
-use edge_bootstrap::api::router;
+use edge_bootstrap::api::{AppState, router};
+use edge_bootstrap::auth::OperatorTokens;
+use edge_bootstrap::challenge::ChallengeManager;
 use edge_bootstrap::config::{AppConfig, default_bind_addr};
-use edge_bootstrap::manifest::{BootstrapManifestV1, PeerRecord, build_manifest_state};
+use edge_bootstrap::manifest::{
+    BootstrapManifestV1, ManifestService, ManifestState, PeerRecord, build_manifest_state,
+};
+use edge_bootstrap::registry::RegistryStore;
 use edge_bootstrap::signer::ManifestSigner;
 use hyper::StatusCode;
 use lazy_static::lazy_static;
 use serde_json::Value;
+use std::path::PathBuf;
+use std::time::Duration;
+use tempfile::tempdir;
 use tower::ServiceExt;
 
 const TEST_SIGNING_KEY_BYTES: [u8; 32] = [7u8; 32];
@@ -16,7 +27,21 @@ lazy_static! {
     static ref TEST_SIGNING_KEY_B64: String = STANDARD_NO_PAD.encode(TEST_SIGNING_KEY_BYTES);
 }
 
-fn test_config() -> AppConfig {
+fn build_app_state(config: &AppConfig, _manifest_state: ManifestState) -> AppState {
+    let registry = RegistryStore::open(&config.registry_db_path).unwrap();
+    let challenges = ChallengeManager::new(Duration::from_secs(config.challenge_ttl_secs));
+    let signer = ManifestSigner::from_base64(&config.signing_key_b64).unwrap();
+    AppState {
+        manifest: ManifestService::new(config.clone(), signer, registry.clone()),
+        registry,
+        challenges,
+        tokens: config.operator_tokens.clone(),
+        admin_tokens: config.admin_tokens.clone(),
+        rate_limiter: edge_bootstrap::api::RateLimiter::new(5.0, 10.0),
+    }
+}
+
+fn test_config(db_path: PathBuf) -> AppConfig {
     AppConfig {
         bind_addr: default_bind_addr(),
         epoch: 1,
@@ -31,12 +56,18 @@ fn test_config() -> AppConfig {
         static_base_urls: vec!["https://static.example.com".into()],
         revoked_peer_ids: vec![],
         cache_max_age_secs: 60,
+        operator_tokens: OperatorTokens::default(),
+        admin_tokens: OperatorTokens::default(),
+        registry_db_path: db_path,
+        challenge_ttl_secs: 120,
+        registry_enabled: false,
     }
 }
 
 #[test]
 fn test_sign_and_verify_manifest_ok() {
-    let config = test_config();
+    let dir = tempdir().unwrap();
+    let config = test_config(dir.path().join("reg1.db"));
     let signer = ManifestSigner::from_base64(&config.signing_key_b64).unwrap();
     let state = build_manifest_state(&config, &signer).unwrap();
 
@@ -52,7 +83,8 @@ fn test_sign_and_verify_manifest_ok() {
 
 #[test]
 fn test_manifest_tamper_fails_verify() {
-    let config = test_config();
+    let dir = tempdir().unwrap();
+    let config = test_config(dir.path().join("reg2.db"));
     let signer = ManifestSigner::from_base64(&config.signing_key_b64).unwrap();
     let state = build_manifest_state(&config, &signer).unwrap();
 
@@ -72,7 +104,8 @@ fn test_manifest_tamper_fails_verify() {
 
 #[test]
 fn test_etag_changes_when_manifest_changes() {
-    let config = test_config();
+    let dir = tempdir().unwrap();
+    let config = test_config(dir.path().join("reg3.db"));
     let signer = ManifestSigner::from_base64(&config.signing_key_b64).unwrap();
     let state_a = build_manifest_state(&config, &signer).unwrap();
 
@@ -85,10 +118,12 @@ fn test_etag_changes_when_manifest_changes() {
 
 #[tokio::test]
 async fn test_manifest_endpoint_headers() {
-    let config = test_config();
+    let dir = tempdir().unwrap();
+    let config = test_config(dir.path().join("reg4.db"));
     let signer = ManifestSigner::from_base64(&config.signing_key_b64).unwrap();
-    let state = build_manifest_state(&config, &signer).unwrap();
-    let app = router(state.clone());
+    let manifest_state = build_manifest_state(&config, &signer).unwrap();
+    let app_state = build_app_state(&config, manifest_state.clone());
+    let app = router(app_state.clone());
 
     let response = app
         .oneshot(
@@ -120,7 +155,7 @@ async fn test_manifest_endpoint_headers() {
     let json: Value = serde_json::from_slice(&body).unwrap();
     assert!(json.get("signature").is_some());
 
-    let response_304 = router(state)
+    let response_304 = router(app_state)
         .oneshot(
             Request::builder()
                 .uri("/bootstrap/manifest")

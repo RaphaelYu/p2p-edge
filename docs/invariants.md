@@ -6,3 +6,4 @@
 - Trust model: clients must verify the Ed25519 signature of the manifest using a trusted verifying key. Manifest content is immutable for its issued epoch/TTL window; rotation is done by changing the signing key or epoch and redeploying.
 - Revocation: `revoked_peer_ids` exists to rapidly withdraw untrusted bootstrap peers. Clients should reject manifests where revoked peers appear in active sets.
 - Freshness: `issued_at` and `expires_at` bound the manifest lifetime; clients must treat manifests past `expires_at` as invalid even if signatures verify.
+- Registry admission and removal: all registry mutations require authenticated tokens; challenge-response proves peer key ownership before enrollment. State transitions are constrained (Pending→Active/Rejected, Active→Revoked), and every mutation is audited. Revocation removes peers from manifests and adds them to `revoked_peer_ids`.

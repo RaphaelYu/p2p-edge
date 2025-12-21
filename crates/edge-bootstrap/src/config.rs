@@ -1,8 +1,10 @@
+use crate::auth::OperatorTokens;
 use crate::error::{BootstrapError, Result};
 use crate::manifest::PeerRecord;
 use serde::Deserialize;
 use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -14,6 +16,11 @@ pub struct AppConfig {
     pub static_base_urls: Vec<String>,
     pub revoked_peer_ids: Vec<String>,
     pub cache_max_age_secs: u64,
+    pub operator_tokens: OperatorTokens,
+    pub admin_tokens: OperatorTokens,
+    pub registry_db_path: PathBuf,
+    pub challenge_ttl_secs: u64,
+    pub registry_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +112,20 @@ impl AppConfig {
             .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
             .unwrap_or_default();
 
+        let operator_tokens = load_operator_tokens()?;
+        let admin_tokens = load_admin_tokens()?;
+        let registry_db_path = env::var("EDGE_REGISTRY_DB_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("registry.db"));
+        let challenge_ttl_secs = env::var("EDGE_CHALLENGE_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        let registry_enabled = env::var("EDGE_REGISTRY_ENABLE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         Ok(AppConfig {
             bind_addr,
             epoch,
@@ -114,6 +135,73 @@ impl AppConfig {
             static_base_urls,
             revoked_peer_ids,
             cache_max_age_secs,
+            operator_tokens,
+            admin_tokens,
+            registry_db_path,
+            challenge_ttl_secs,
+            registry_enabled,
         })
+    }
+}
+
+fn load_operator_tokens() -> Result<OperatorTokens> {
+    if let Ok(raw) = env::var("EDGE_OPERATOR_TOKENS_HASHED_JSON") {
+        let entries: Vec<TokenPair> = serde_json::from_str(&raw).map_err(|e| {
+            BootstrapError::Config(format!("invalid EDGE_OPERATOR_TOKENS_HASHED_JSON: {e}"))
+        })?;
+        let pairs: Vec<(String, String)> = entries
+            .into_iter()
+            .map(|t| (t.operator_id, t.token))
+            .collect();
+        OperatorTokens::from_hashed(pairs).ok_or_else(|| {
+            BootstrapError::Config("invalid token hash format; expect hex sha256".to_string())
+        })
+    } else if let Ok(raw) = env::var("EDGE_OPERATOR_TOKENS_JSON") {
+        let entries: Vec<TokenPair> = serde_json::from_str(&raw).map_err(|e| {
+            BootstrapError::Config(format!("invalid EDGE_OPERATOR_TOKENS_JSON: {e}"))
+        })?;
+        let pairs: Vec<(String, String)> = entries
+            .into_iter()
+            .map(|t| (t.operator_id, t.token))
+            .collect();
+        Ok(OperatorTokens::from_plain(pairs))
+    } else {
+        Ok(OperatorTokens::default())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenPair {
+    operator_id: String,
+    token: String,
+}
+
+fn load_admin_tokens() -> Result<OperatorTokens> {
+    if let Ok(raw) = env::var("EDGE_ADMIN_TOKENS_HASHED_JSON") {
+        let entries: Vec<TokenPair> = serde_json::from_str(&raw).map_err(|e| {
+            BootstrapError::Config(format!("invalid EDGE_ADMIN_TOKENS_HASHED_JSON: {e}"))
+        })?;
+        let pairs: Vec<(String, String)> = entries
+            .into_iter()
+            .map(|t| (t.operator_id, t.token))
+            .collect();
+        OperatorTokens::from_hashed(pairs).ok_or_else(|| {
+            BootstrapError::Config("invalid admin token hash format; expect hex sha256".to_string())
+        })
+    } else if let Ok(raw) = env::var("EDGE_ADMIN_TOKENS_JSON") {
+        let entries: Vec<TokenPair> = serde_json::from_str(&raw)
+            .map_err(|e| BootstrapError::Config(format!("invalid EDGE_ADMIN_TOKENS_JSON: {e}")))?;
+        let pairs: Vec<(String, String)> = entries
+            .into_iter()
+            .map(|t| (t.operator_id, t.token))
+            .collect();
+        Ok(OperatorTokens::from_plain(pairs))
+    } else if let Ok(token) = env::var("EDGE_ADMIN_TOKEN") {
+        Ok(OperatorTokens::from_plain(vec![(
+            "admin".to_string(),
+            token,
+        )]))
+    } else {
+        Ok(OperatorTokens::default())
     }
 }

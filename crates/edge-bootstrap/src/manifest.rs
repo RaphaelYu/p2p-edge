@@ -1,10 +1,12 @@
 use crate::config::AppConfig;
 use crate::error::{BootstrapError, Result};
+use crate::registry::{NodeRecord, NodeStatus, RegistryStore};
 use crate::signer::ManifestSigner;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -112,6 +114,117 @@ pub fn build_manifest_state(config: &AppConfig, signer: &ManifestSigner) -> Resu
         cache_control,
         canonical_bytes,
     })
+}
+
+#[derive(Clone)]
+pub struct ManifestService {
+    config: AppConfig,
+    signer: ManifestSigner,
+    registry: RegistryStore,
+    cache: Arc<Mutex<Option<(ManifestState, String)>>>,
+}
+
+impl ManifestService {
+    pub fn new(config: AppConfig, signer: ManifestSigner, registry: RegistryStore) -> Self {
+        Self {
+            config,
+            signer,
+            registry,
+            cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn current(&self) -> Result<ManifestState> {
+        let (peers, revoked, source_hash) = self.collect_sources()?;
+        {
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|_| BootstrapError::Config("manifest cache poisoned".to_string()))?;
+            if let Some((state, cached_hash)) = cache.as_ref() {
+                if *cached_hash == source_hash && !is_expired(&state.manifest.expires_at) {
+                    return Ok(state.clone());
+                }
+            }
+        }
+
+        let issued_at = OffsetDateTime::now_utc();
+        let expires_at = issued_at + Duration::seconds(self.config.ttl_secs as i64);
+        let unsigned = UnsignedBootstrapManifest {
+            version: "v1".to_string(),
+            epoch: self.config.epoch,
+            issued_at: issued_at.format(&Rfc3339)?,
+            expires_at: expires_at.format(&Rfc3339)?,
+            bootstrap_peers: peers,
+            static_base_urls: self.config.static_base_urls.clone(),
+            revoked_peer_ids: revoked,
+        };
+
+        let canonical_bytes = unsigned.canonical_bytes()?;
+        let signature = self.signer.sign(&canonical_bytes)?;
+        let manifest = unsigned.into_signed(signature);
+        let etag = compute_etag(&canonical_bytes);
+        let cache_control = format!("public, max-age={}", self.config.cache_max_age_secs);
+
+        let state = ManifestState {
+            manifest,
+            etag,
+            cache_control,
+            canonical_bytes,
+        };
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| BootstrapError::Config("manifest cache poisoned".to_string()))?;
+        *cache = Some((state.clone(), source_hash));
+        Ok(state)
+    }
+
+    fn collect_sources(&self) -> Result<(Vec<PeerRecord>, Vec<String>, String)> {
+        let (peers, revoked) = if self.config.registry_enabled {
+            let active = self.registry.list_by_status(Some(NodeStatus::Active))?;
+            let peers = active.into_iter().map(node_to_peer).collect();
+            let mut revoked = self
+                .registry
+                .list_by_status(Some(NodeStatus::Revoked))?
+                .into_iter()
+                .map(|n| n.peer_id)
+                .collect::<Vec<_>>();
+            // include configured revoked ids too
+            revoked.extend(self.config.revoked_peer_ids.clone());
+            revoked.sort();
+            revoked.dedup();
+            (peers, revoked)
+        } else {
+            (
+                self.config.peers.clone(),
+                self.config.revoked_peer_ids.clone(),
+            )
+        };
+        let mut hash_hasher = Sha256::new();
+        hash_hasher.update(format!("{:?}", peers));
+        hash_hasher.update(format!("{:?}", revoked));
+        hash_hasher.update(self.config.epoch.to_le_bytes());
+        hash_hasher.update(self.config.static_base_urls.join(",").as_bytes());
+        let source_hash = STANDARD_NO_PAD.encode(hash_hasher.finalize());
+        Ok((peers, revoked, source_hash))
+    }
+}
+
+fn node_to_peer(node: NodeRecord) -> PeerRecord {
+    PeerRecord {
+        peer_id: node.peer_id,
+        addrs: node.addrs,
+        tags: node.tags,
+        weight: node.weight,
+    }
+}
+
+fn is_expired(expires_at: &str) -> bool {
+    if let Ok(ts) = OffsetDateTime::parse(expires_at, &Rfc3339) {
+        return ts < OffsetDateTime::now_utc();
+    }
+    true
 }
 
 fn compute_etag(bytes: &[u8]) -> String {

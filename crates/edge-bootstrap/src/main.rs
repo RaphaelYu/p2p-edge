@@ -1,8 +1,11 @@
 use anyhow::Result;
-use edge_bootstrap::api::router;
+use edge_bootstrap::api::{AppState, RateLimiter, router};
+use edge_bootstrap::challenge::ChallengeManager;
 use edge_bootstrap::config::AppConfig;
-use edge_bootstrap::manifest::build_manifest_state;
+use edge_bootstrap::manifest::ManifestService;
+use edge_bootstrap::registry::RegistryStore;
 use edge_bootstrap::signer::ManifestSigner;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -17,7 +20,18 @@ async fn main() -> Result<()> {
 
     let config = AppConfig::load()?;
     let signer = ManifestSigner::from_base64(&config.signing_key_b64)?;
-    let state = build_manifest_state(&config, &signer)?;
+    let registry = RegistryStore::open(&config.registry_db_path)?;
+    let state = ManifestService::new(config.clone(), signer.clone(), registry.clone());
+    let challenges = ChallengeManager::new(Duration::from_secs(config.challenge_ttl_secs));
+
+    let app_state = AppState {
+        manifest: state,
+        registry,
+        challenges,
+        tokens: config.operator_tokens.clone(),
+        admin_tokens: config.admin_tokens.clone(),
+        rate_limiter: RateLimiter::new(5.0, 10.0),
+    };
 
     info!(
         "edge-bootstrap listening on {} (epoch={}, ttl_secs={}, peers={})",
@@ -28,6 +42,6 @@ async fn main() -> Result<()> {
     );
 
     let listener = TcpListener::bind(config.bind_addr).await?;
-    axum::serve(listener, router(state)).await?;
+    axum::serve(listener, router(app_state)).await?;
     Ok(())
 }
