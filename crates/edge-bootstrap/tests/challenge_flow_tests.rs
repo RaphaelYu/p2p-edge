@@ -47,6 +47,9 @@ fn base_app_state(challenge_ttl: u64) -> (AppState, RegistryStore, TempDir) {
         registry_db_path: registry_path.clone(),
         challenge_ttl_secs: challenge_ttl,
         registry_enabled: true,
+        probe_recent_secs: 300,
+        probe_fail_threshold: 3,
+        probe_interval_secs: 60,
     };
 
     let signer = ManifestSigner::from_base64(&config.signing_key_b64).unwrap();

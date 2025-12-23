@@ -56,6 +56,10 @@ pub struct NodeRecord {
     pub last_approved_at: Option<i64>,
     pub revoked_reason: Option<String>,
     pub pubkey_b64: Option<String>,
+    pub last_probe_at: Option<i64>,
+    pub probe_ok: Option<bool>,
+    pub fail_count: u32,
+    pub last_error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,7 +130,11 @@ impl RegistryStore {
                 updated_at INTEGER NOT NULL,
                 last_approved_at INTEGER,
                 revoked_reason TEXT,
-                pubkey_b64 TEXT
+                pubkey_b64 TEXT,
+                last_probe_at INTEGER,
+                probe_ok INTEGER,
+                fail_count INTEGER DEFAULT 0,
+                last_error_code TEXT
             );
 
             CREATE TABLE IF NOT EXISTS audits (
@@ -142,6 +150,13 @@ impl RegistryStore {
         .map_err(|e| BootstrapError::Config(e.to_string()))?;
         // If the database pre-exists, best-effort add pubkey column without failing startup.
         let _ = conn.execute("ALTER TABLE nodes ADD COLUMN pubkey_b64 TEXT", []);
+        let _ = conn.execute("ALTER TABLE nodes ADD COLUMN last_probe_at INTEGER", []);
+        let _ = conn.execute("ALTER TABLE nodes ADD COLUMN probe_ok INTEGER", []);
+        let _ = conn.execute(
+            "ALTER TABLE nodes ADD COLUMN fail_count INTEGER DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE nodes ADD COLUMN last_error_code TEXT", []);
         Ok(())
     }
 
@@ -175,7 +190,7 @@ impl RegistryStore {
                     operator_id=excluded.operator_id,
                     updated_at=excluded.updated_at,
                     revoked_reason=NULL,
-                    pubkey_b64=excluded.pubkey_b64
+                pubkey_b64=excluded.pubkey_b64
                 "#,
                 params![peer_id, addrs_json, tags_json, weight as i64, operator_id, now, pubkey_b64],
             )
@@ -371,7 +386,44 @@ impl RegistryStore {
             last_approved_at: row.get("last_approved_at")?,
             revoked_reason: row.get("revoked_reason")?,
             pubkey_b64: row.get("pubkey_b64")?,
+            last_probe_at: row.get("last_probe_at")?,
+            probe_ok: row.get::<_, Option<i64>>("probe_ok")?.map(|v| v != 0),
+            fail_count: row.get::<_, i64>("fail_count")? as u32,
+            last_error_code: row.get("last_error_code")?,
         })
+    }
+
+    pub fn update_probe(
+        &self,
+        peer_id: &str,
+        ok: bool,
+        error_code: Option<String>,
+    ) -> Result<(), BootstrapError> {
+        let conn = self.conn()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let fail_increment = if ok { 0 } else { 1 };
+        conn.execute(
+            r#"
+            UPDATE nodes SET
+                last_probe_at = ?1,
+                probe_ok = ?2,
+                fail_count = CASE
+                    WHEN ?2 = 1 THEN 0
+                    ELSE fail_count + ?3
+                END,
+                last_error_code = ?4
+            WHERE peer_id = ?5
+            "#,
+            params![
+                now,
+                if ok { 1 } else { 0 },
+                fail_increment,
+                error_code,
+                peer_id
+            ],
+        )
+        .map_err(|e| BootstrapError::Config(e.to_string()))?;
+        Ok(())
     }
 
     fn insert_audit(

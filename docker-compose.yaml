@@ -1,0 +1,80 @@
+version: "3.9"
+
+services:
+  bootstrap:
+    build:
+      context: .
+      dockerfile: crates/edge-bootstrap/Dockerfile
+    environment:
+      EDGE_BIND_ADDR: "0.0.0.0:8080"
+      EDGE_MANIFEST_EPOCH: "1"
+      EDGE_MANIFEST_TTL_SECS: "3600"
+      EDGE_CACHE_MAX_AGE_SECS: "60"
+      EDGE_SIGNING_KEY_B64: "${EDGE_SIGNING_KEY_B64}"
+      EDGE_BOOTSTRAP_PEERS_JSON: "[]"
+      EDGE_STATIC_BASE_URLS_JSON: "[]"
+      EDGE_REVOKED_PEER_IDS_JSON: "[]"
+      EDGE_REGISTRY_ENABLE: "true"
+      EDGE_OPERATOR_TOKENS_JSON: '[{"operator_id":"ops-1","token":"op_secret"}]'
+      EDGE_ADMIN_TOKENS_JSON: '[{"operator_id":"admin-1","token":"admin_secret"}]'
+      EDGE_PROBE_INTERVAL_SECS: "15"
+      EDGE_PROBE_RECENT_SECS: "120"
+      EDGE_PROBE_FAIL_THRESHOLD: "3"
+    ports:
+      - "8080:8080"
+    volumes:
+      - bootstrap-data:/app/data
+    networks:
+      - edge-net
+
+  gw1:
+    build: &gateway-build
+      context: .
+      dockerfile: crates/edge-gateway/Dockerfile
+    environment: &gateway-env
+      EDGE_GATEWAY_CONFIG: /app/gateway.config.json
+    volumes:
+      - ./gateway1.config.json:/app/gateway.config.json:ro
+    depends_on: &gateway-dep
+      - bootstrap
+    networks: &gateway-net
+      - edge-net
+
+  gw2:
+    build: *gateway-build
+    environment: *gateway-env
+    depends_on: *gateway-dep
+    networks: *gateway-net
+    volumes:
+      - ./gateway2.config.json:/app/gateway.config.json:ro
+
+  gw3:
+    build: *gateway-build
+    environment: *gateway-env
+    depends_on: *gateway-dep
+    networks: *gateway-net
+    volumes:
+      - ./gateway3.config.json:/app/gateway.config.json:ro
+
+  approver:
+    image: python:3.11-slim
+    depends_on:
+      - bootstrap
+    environment:
+      BOOTSTRAP_URL: "http://bootstrap:8080"
+      ADMIN_TOKEN: "admin_secret"
+      SLEEP_SECS: "3"
+      MAX_ROUNDS: "30"
+    volumes:
+      - ./scripts/approver.py:/app/approver.py:ro
+    working_dir: /app
+    command: ["python", "/app/approver.py"]
+    networks:
+      - edge-net
+
+networks:
+  edge-net:
+    driver: bridge
+
+volumes:
+  bootstrap-data:

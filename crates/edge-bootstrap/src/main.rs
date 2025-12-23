@@ -3,6 +3,7 @@ use edge_bootstrap::api::{AppState, RateLimiter, router};
 use edge_bootstrap::challenge::ChallengeManager;
 use edge_bootstrap::config::AppConfig;
 use edge_bootstrap::manifest::ManifestService;
+use edge_bootstrap::prober::run_probe_loop;
 use edge_bootstrap::registry::RegistryStore;
 use edge_bootstrap::signer::ManifestSigner;
 use std::time::Duration;
@@ -23,6 +24,13 @@ async fn main() -> Result<()> {
     let registry = RegistryStore::open(&config.registry_db_path)?;
     let state = ManifestService::new(config.clone(), signer.clone(), registry.clone());
     let challenges = ChallengeManager::new(Duration::from_secs(config.challenge_ttl_secs));
+    if config.registry_enabled {
+        let probe_config = config.clone();
+        let probe_registry = registry.clone();
+        tokio::spawn(async move {
+            run_probe_loop(probe_config, probe_registry).await;
+        });
+    }
 
     let app_state = AppState {
         manifest: state,

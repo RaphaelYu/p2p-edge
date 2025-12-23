@@ -61,6 +61,9 @@ fn test_config(db_path: PathBuf) -> AppConfig {
         registry_db_path: db_path,
         challenge_ttl_secs: 120,
         registry_enabled: false,
+        probe_recent_secs: 300,
+        probe_fail_threshold: 3,
+        probe_interval_secs: 60,
     }
 }
 

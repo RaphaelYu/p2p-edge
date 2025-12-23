@@ -29,6 +29,7 @@ pub struct BootstrapManifestV1 {
     pub epoch: u64,
     pub issued_at: String,
     pub expires_at: String,
+    pub signing_key_id: String,
     pub bootstrap_peers: Vec<PeerRecord>,
     pub static_base_urls: Vec<String>,
     pub revoked_peer_ids: Vec<String>,
@@ -41,6 +42,7 @@ pub struct UnsignedBootstrapManifest {
     pub epoch: u64,
     pub issued_at: String,
     pub expires_at: String,
+    pub signing_key_id: String,
     pub bootstrap_peers: Vec<PeerRecord>,
     pub static_base_urls: Vec<String>,
     pub revoked_peer_ids: Vec<String>,
@@ -57,6 +59,7 @@ impl UnsignedBootstrapManifest {
             epoch: self.epoch,
             issued_at: self.issued_at,
             expires_at: self.expires_at,
+            signing_key_id: self.signing_key_id,
             bootstrap_peers: self.bootstrap_peers,
             static_base_urls: self.static_base_urls,
             revoked_peer_ids: self.revoked_peer_ids,
@@ -72,6 +75,7 @@ impl BootstrapManifestV1 {
             epoch: self.epoch,
             issued_at: self.issued_at.clone(),
             expires_at: self.expires_at.clone(),
+            signing_key_id: self.signing_key_id.clone(),
             bootstrap_peers: self.bootstrap_peers.clone(),
             static_base_urls: self.static_base_urls.clone(),
             revoked_peer_ids: self.revoked_peer_ids.clone(),
@@ -96,6 +100,7 @@ pub fn build_manifest_state(config: &AppConfig, signer: &ManifestSigner) -> Resu
         epoch: config.epoch,
         issued_at: issued_at.format(&Rfc3339)?,
         expires_at: expires_at.format(&Rfc3339)?,
+        signing_key_id: config.signing_key_id.clone(),
         bootstrap_peers: config.peers.clone(),
         static_base_urls: config.static_base_urls.clone(),
         revoked_peer_ids: config.revoked_peer_ids.clone(),
@@ -155,6 +160,7 @@ impl ManifestService {
             epoch: self.config.epoch,
             issued_at: issued_at.format(&Rfc3339)?,
             expires_at: expires_at.format(&Rfc3339)?,
+            signing_key_id: self.config.signing_key_id.clone(),
             bootstrap_peers: peers,
             static_base_urls: self.config.static_base_urls.clone(),
             revoked_peer_ids: revoked,
@@ -183,7 +189,17 @@ impl ManifestService {
     fn collect_sources(&self) -> Result<(Vec<PeerRecord>, Vec<String>, String)> {
         let (peers, revoked) = if self.config.registry_enabled {
             let active = self.registry.list_by_status(Some(NodeStatus::Active))?;
-            let peers = active.into_iter().map(node_to_peer).collect();
+            let peers = active
+                .into_iter()
+                .filter(|n| {
+                    is_recently_healthy(
+                        n,
+                        self.config.probe_recent_secs,
+                        self.config.probe_fail_threshold,
+                    )
+                })
+                .map(node_to_peer)
+                .collect();
             let mut revoked = self
                 .registry
                 .list_by_status(Some(NodeStatus::Revoked))?
@@ -218,6 +234,23 @@ fn node_to_peer(node: NodeRecord) -> PeerRecord {
         tags: node.tags,
         weight: node.weight,
     }
+}
+
+fn is_recently_healthy(node: &NodeRecord, recent_secs: u64, fail_threshold: u32) -> bool {
+    if node.fail_count >= fail_threshold {
+        return false;
+    }
+    if let (Some(ts), Some(ok)) = (node.last_probe_at, node.probe_ok) {
+        if !ok {
+            return false;
+        }
+        if let Ok(probe_time) = OffsetDateTime::from_unix_timestamp(ts) {
+            let cutoff = OffsetDateTime::now_utc() - Duration::seconds(recent_secs as i64);
+            return probe_time >= cutoff;
+        }
+        return false;
+    }
+    true
 }
 
 fn is_expired(expires_at: &str) -> bool {

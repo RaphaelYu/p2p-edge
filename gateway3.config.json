@@ -1,0 +1,9 @@
+{
+  "listen_multiaddrs": ["/ip4/0.0.0.0/tcp/4003"],
+  "secret_key_b64": "1/XyCEOw1sjDh0DCXCYKWDwopxexDSdKVsRDlwM2pxc=",
+  "bootstrap_api_url": "http://bootstrap:8080",
+  "bootstrap_manifest_urls": ["http://bootstrap:8080/bootstrap/manifest"],
+  "operator_token": "op_secret",
+  "admin_token": "admin_secret",
+  "mode": "bootstrap"
+}

@@ -13,6 +13,7 @@ serde_json = { workspace = true }
 ed25519-dalek = { workspace = true }
 base64 = "0.21"
 sha2 = "0.10"
+multiaddr = { workspace = true }
 time = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -24,6 +25,9 @@ rusqlite = { version = "0.31", features = ["bundled", "time"] }
 tempfile = "3.10"
 subtle = "2.5"
 rand = { workspace = true }
+libp2p = { workspace = true }
+futures = "0.3"
+async-trait = "0.1"
 
 [dev-dependencies]
 lazy_static = "1.4"

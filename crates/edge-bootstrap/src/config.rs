@@ -12,6 +12,7 @@ pub struct AppConfig {
     pub epoch: u64,
     pub ttl_secs: u64,
     pub signing_key_b64: String,
+    pub signing_key_id: String,
     pub peers: Vec<PeerRecord>,
     pub static_base_urls: Vec<String>,
     pub revoked_peer_ids: Vec<String>,
@@ -21,6 +22,9 @@ pub struct AppConfig {
     pub registry_db_path: PathBuf,
     pub challenge_ttl_secs: u64,
     pub registry_enabled: bool,
+    pub probe_recent_secs: u64,
+    pub probe_fail_threshold: u32,
+    pub probe_interval_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +85,12 @@ impl AppConfig {
 
         let signing_key_b64 = env::var("EDGE_SIGNING_KEY_B64")
             .map_err(|_| BootstrapError::Config("EDGE_SIGNING_KEY_B64 is required".to_string()))?;
+        let signing_key_id = env::var("EDGE_SIGNING_KEY_ID").unwrap_or_else(|_| "default".into());
+
+        let registry_enabled = env::var("EDGE_REGISTRY_ENABLE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         let peers_json = env::var("EDGE_BOOTSTRAP_PEERS_JSON").map_err(|_| {
             BootstrapError::Config("EDGE_BOOTSTRAP_PEERS_JSON is required".to_string())
@@ -91,7 +101,7 @@ impl AppConfig {
             .map(PeerRecordInput::into_peer_record)
             .collect();
 
-        if peers.is_empty() {
+        if peers.is_empty() && !registry_enabled {
             return Err(BootstrapError::Config(
                 "at least one bootstrap peer is required".to_string(),
             ));
@@ -124,13 +134,26 @@ impl AppConfig {
         let registry_enabled = env::var("EDGE_REGISTRY_ENABLE")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .unwrap_or(registry_enabled);
+        let probe_recent_secs = env::var("EDGE_PROBE_RECENT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let probe_fail_threshold = env::var("EDGE_PROBE_FAIL_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let probe_interval_secs = env::var("EDGE_PROBE_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
 
         Ok(AppConfig {
             bind_addr,
             epoch,
             ttl_secs,
             signing_key_b64,
+            signing_key_id,
             peers,
             static_base_urls,
             revoked_peer_ids,
@@ -140,6 +163,9 @@ impl AppConfig {
             registry_db_path,
             challenge_ttl_secs,
             registry_enabled,
+            probe_recent_secs,
+            probe_fail_threshold,
+            probe_interval_secs,
         })
     }
 }

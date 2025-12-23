@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Preferred: point to a JSON config file instead of individual envs.
+# Usage: export EDGE_GATEWAY_CONFIG=./gateway.config.json
+# Example gateway.config.json:
+# {
+#   "listen_multiaddrs": ["/ip4/0.0.0.0/tcp/4001"],
+#   "secret_key_b64": "REPLACE_WITH_GATEWAY_ED25519_KEY_B64",
+#   "bootstrap_api_url": "http://127.0.0.1:8080",
+#   "bootstrap_manifest_urls": ["http://127.0.0.1:8080/bootstrap/manifest"],
+#   "operator_token": "op_secret",
+#   "admin_token": "admin_secret",
+#   "mode": "bootstrap"
+# }
+
+export EDGE_GATEWAY_CONFIG="${EDGE_GATEWAY_CONFIG:-./gateway.config.json}"

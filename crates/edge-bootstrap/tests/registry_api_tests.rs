@@ -40,6 +40,9 @@ fn make_config(registry_path: &std::path::Path) -> AppConfig {
         registry_db_path: registry_path.to_path_buf(),
         challenge_ttl_secs: 120,
         registry_enabled: true,
+        probe_recent_secs: 300,
+        probe_fail_threshold: 3,
+        probe_interval_secs: 60,
     }
 }
 
