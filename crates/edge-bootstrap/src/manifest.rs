@@ -1,5 +1,6 @@
 use crate::config::AppConfig;
 use crate::error::{BootstrapError, Result};
+use crate::metrics::GLOBAL_METRICS;
 use crate::registry::{NodeRecord, NodeStatus, RegistryStore};
 use crate::signer::ManifestSigner;
 use base64::Engine;
@@ -152,6 +153,13 @@ impl ManifestService {
                 }
             }
         }
+        let previous_etag = {
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|_| BootstrapError::Config("manifest cache poisoned".to_string()))?;
+            cache.as_ref().map(|(s, _)| s.etag.clone())
+        };
 
         let issued_at = OffsetDateTime::now_utc();
         let expires_at = issued_at + Duration::seconds(self.config.ttl_secs as i64);
@@ -178,6 +186,14 @@ impl ManifestService {
             cache_control,
             canonical_bytes,
         };
+        GLOBAL_METRICS.manifest_issued.inc();
+        if let Some(prev) = previous_etag {
+            if prev != state.etag {
+                GLOBAL_METRICS.manifest_etag_changes.inc();
+            }
+        } else {
+            GLOBAL_METRICS.manifest_etag_changes.inc();
+        }
         let mut cache = self
             .cache
             .lock()

@@ -639,6 +639,8 @@ dependencies = [
  "lazy_static",
  "libp2p",
  "multiaddr",
+ "once_cell",
+ "prometheus",
  "rand 0.8.5",
  "rusqlite",
  "serde",
@@ -672,10 +674,14 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
  "time",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "void",
 ]
 
 [[package]]
@@ -3205,6 +3211,7 @@ checksum = "2efa149fe76073d6e8fd97ef4f4eca7b67f599660115591483572e406e165594"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "pin-project-lite",
  "tokio",

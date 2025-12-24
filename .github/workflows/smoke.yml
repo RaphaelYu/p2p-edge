@@ -1,0 +1,23 @@
+name: smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  compose-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set env
+        run: |
+          echo "EDGE_SIGNING_KEY_B64=$(python3 - <<'PY'
+import os, base64
+print(base64.b64encode(os.urandom(32)).decode())
+PY)" >> $GITHUB_ENV
+          echo "COMPOSE_PROJECT_NAME=p2p-edge-ci" >> $GITHUB_ENV
+      - name: Smoke test
+        run: |
+          chmod +x scripts/smoke.sh
+          ./scripts/smoke.sh

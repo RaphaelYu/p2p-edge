@@ -3,6 +3,7 @@ use edge_bootstrap::api::{AppState, RateLimiter, router};
 use edge_bootstrap::challenge::ChallengeManager;
 use edge_bootstrap::config::AppConfig;
 use edge_bootstrap::manifest::ManifestService;
+use edge_bootstrap::metrics::GLOBAL_METRICS;
 use edge_bootstrap::prober::run_probe_loop;
 use edge_bootstrap::registry::RegistryStore;
 use edge_bootstrap::signer::ManifestSigner;
@@ -39,6 +40,7 @@ async fn main() -> Result<()> {
         tokens: config.operator_tokens.clone(),
         admin_tokens: config.admin_tokens.clone(),
         rate_limiter: RateLimiter::new(5.0, 10.0),
+        metrics: GLOBAL_METRICS.clone(),
     };
 
     info!(

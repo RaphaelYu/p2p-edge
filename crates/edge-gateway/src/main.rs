@@ -24,12 +24,15 @@ use std::{
     env, fs,
     net::SocketAddr,
     str::FromStr,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::signal;
 use tracing::{info, warn};
 
+use forwarding::config::{ForwardRule, load_forward_rules};
+mod forwarding;
 mod manifest;
 mod proto;
 
@@ -50,18 +53,27 @@ struct GatewayConfig {
     secret_key_path: Option<String>,
     manifest_pubkey_b64: Option<String>,
     manifest_pubkeys_b64: Option<Vec<String>>,
+    manifest_trusted_keys: Option<HashMap<String, String>>,
     manifest_poll_secs: Option<u64>,
     target_peers: Option<usize>,
+    min_peers: Option<usize>,
+    max_peers: Option<usize>,
     redial_secs: Option<u64>,
     dial_batch_size: Option<usize>,
     backoff_base_secs: Option<u64>,
     backoff_max_secs: Option<u64>,
     metrics_bind: Option<String>,
+    manifest_grace_secs: Option<u64>,
+    forward_rules: Option<Vec<ForwardRule>>,
+    forward_max_streams: Option<usize>,
+    forward_wait_timeout_secs: Option<u64>,
+    forward_connect_timeout_secs: Option<u64>,
 }
 
 #[derive(NetworkBehaviour)]
 struct GatewayBehaviour {
     ping: RequestResponse<proto::PingCodec>,
+    forward: forwarding::behaviour::ForwardingBehaviour,
 }
 
 #[tokio::main]
@@ -78,11 +90,15 @@ async fn main() -> Result<()> {
     let key_b64 = load_secret_key(&cfg)?;
     let (signing_key, peer_id, verifying_key_b64) = build_keys(&key_b64)?;
     info!("edge-gateway peer_id={peer_id}");
-    let manifest_vks = load_manifest_verifiers(
+    let manifest_keys = load_manifest_keys(
+        cfg.manifest_trusted_keys.as_ref(),
         cfg.manifest_pubkeys_b64.as_ref(),
         cfg.manifest_pubkey_b64.as_deref(),
     )?;
     let metrics = Metrics::new()?;
+    let manifest_cache = Arc::new(Mutex::new(ManifestCache::default()));
+    let forward_handler =
+        forwarding::handler::Handler::new(cfg.forward_rules.clone().unwrap_or_default());
 
     // metrics server
     if let Some(bind) = cfg.metrics_bind.as_deref() {
@@ -101,7 +117,7 @@ async fn main() -> Result<()> {
         warn!("registration failed: {e}");
     }
 
-    let mut swarm = build_swarm(signing_key)?;
+    let mut swarm = build_swarm(signing_key, &forward_handler, &cfg)?;
     let mut connected: HashSet<PeerId> = HashSet::new();
     let mut last_dial: HashMap<PeerId, Instant> = HashMap::new();
     // jitter start to avoid herd dialing
@@ -114,13 +130,14 @@ async fn main() -> Result<()> {
     // initial dial
     if let Err(e) = dial_manifest_peers(
         &cfg,
-        &manifest_vks,
+        &manifest_keys,
         &mut swarm,
         &peer_id,
         &mut connected,
         &mut last_dial,
         &mut std::collections::HashMap::new(),
         &metrics,
+        &manifest_cache,
     )
     .await
     {
@@ -147,7 +164,7 @@ async fn main() -> Result<()> {
                 handle_event(&mut swarm, event, &mut connected, &mut last_dial, &metrics);
             }
             _ = manifest_interval.tick() => {
-                if let Err(e) = dial_manifest_peers(&cfg, &manifest_vks, &mut swarm, &peer_id, &mut connected, &mut last_dial, &mut std::collections::HashMap::new(), &metrics).await {
+                if let Err(e) = dial_manifest_peers(&cfg, &manifest_keys, &mut swarm, &peer_id, &mut connected, &mut last_dial, &mut std::collections::HashMap::new(), &metrics, &manifest_cache).await {
                     warn!("manifest poll failed: {e}");
                 }
             }
@@ -197,11 +214,13 @@ fn handle_event(
             RequestResponseEvent::OutboundFailure { peer, error, .. },
         )) => {
             warn!("ping outbound failure to {peer}: {error}");
+            metrics.ping_fail.inc();
         }
         SwarmEvent::Behaviour(GatewayBehaviourEvent::Ping(
             RequestResponseEvent::InboundFailure { peer, error, .. },
         )) => {
             warn!("ping inbound failure from {peer}: {error}");
+            metrics.ping_fail.inc();
         }
         SwarmEvent::Behaviour(GatewayBehaviourEvent::Ping(
             RequestResponseEvent::ResponseSent { peer, .. },
@@ -225,7 +244,11 @@ fn handle_event(
     }
 }
 
-fn build_swarm(signing_key: SigningKey) -> Result<Swarm<GatewayBehaviour>> {
+fn build_swarm(
+    signing_key: SigningKey,
+    forward_handler: &forwarding::handler::Handler,
+    cfg: &GatewayConfig,
+) -> Result<Swarm<GatewayBehaviour>> {
     let ed_kp = ed25519_to_identity(&signing_key)?;
     let noise_config = noise::Config::new(&ed_kp)?;
 
@@ -236,7 +259,25 @@ fn build_swarm(signing_key: SigningKey) -> Result<Swarm<GatewayBehaviour>> {
         rr_config,
     );
 
-    let behaviour = GatewayBehaviour { ping: ping_proto };
+    let forward_protocols =
+        forwarding::behaviour::forwarding_supported_protocols(forward_handler)?;
+    let forward_limiter = forwarding::limiter::ForwardLimiter::new(
+        cfg.forward_max_streams.unwrap_or(200),
+        Duration::from_secs(cfg.forward_wait_timeout_secs.unwrap_or(1)),
+    );
+    let forward_router = std::sync::Arc::new(forwarding::router::Router::new(
+        cfg.forward_rules.as_deref().unwrap_or(&[]),
+    ));
+    let forward = forwarding::behaviour::ForwardingBehaviour::new(
+        forward_protocols,
+        Some(forward_limiter),
+        forward_router,
+        Duration::from_secs(cfg.forward_connect_timeout_secs.unwrap_or(2)),
+    );
+    let behaviour = GatewayBehaviour {
+        ping: ping_proto,
+        forward,
+    };
 
     let transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
         .upgrade(upgrade::Version::V1Lazy)
@@ -322,13 +363,14 @@ async fn register_with_directory(
 
 async fn dial_manifest_peers(
     cfg: &GatewayConfig,
-    manifest_vks: &[VerifyingKey],
+    manifest_keys: &ManifestKeys,
     swarm: &mut Swarm<GatewayBehaviour>,
     self_peer: &str,
     connected: &mut HashSet<PeerId>,
     last_dial: &mut HashMap<PeerId, Instant>,
     fail_counts: &mut HashMap<PeerId, u32>,
     metrics: &Metrics,
+    cache: &Arc<Mutex<ManifestCache>>,
 ) -> Result<()> {
     let urls = &cfg.bootstrap_manifest_urls;
     if urls.is_empty() {
@@ -356,11 +398,26 @@ async fn dial_manifest_peers(
         }
     }
     let m = match manifest_doc {
-        Some(m) => m,
-        None => return Ok(()),
+        Some(m) => {
+            verify_manifest(&m, manifest_keys)?;
+            let mut lock = cache.lock().unwrap();
+            lock.push(m.clone());
+            m
+        }
+        None => {
+            match cache
+                .lock()
+                .unwrap()
+                .last_good(cfg.manifest_grace_secs.unwrap_or(300))
+            {
+                Some(cached) => {
+                    warn!("using cached manifest due to fetch/parse failures");
+                    cached
+                }
+                None => return Ok(()),
+            }
+        }
     };
-
-    verify_manifest(&m, manifest_vks)?;
 
     // drop revoked and self
     let mut peers: Vec<_> = m
@@ -369,6 +426,8 @@ async fn dial_manifest_peers(
         .filter(|p| p.peer_id != self_peer && !m.revoked_peer_ids.contains(&p.peer_id))
         .collect();
     let target = cfg.target_peers.unwrap_or(8);
+    let _min_peers = cfg.min_peers.unwrap_or(target / 2);
+    let max_peers = cfg.max_peers.unwrap_or(target);
     let dial_batch = cfg.dial_batch_size.unwrap_or(4);
     let backoff_base = Duration::from_secs(cfg.backoff_base_secs.unwrap_or(30));
     let backoff_max = Duration::from_secs(cfg.backoff_max_secs.unwrap_or(300));
@@ -378,7 +437,7 @@ async fn dial_manifest_peers(
 
     let mut dialed = 0usize;
     for peer in peers {
-        if connected.len() >= target {
+        if connected.len() >= max_peers {
             break;
         }
         if dialed >= dial_batch {
@@ -424,7 +483,11 @@ async fn dial_manifest_peers(
             .behaviour_mut()
             .ping
             .send_request(&peer_id, proto::PingRequest {});
+        if connected.len() + dialed >= max_peers {
+            break;
+        }
     }
+    // continue dialing in future ticks until min_peers satisfied
     Ok(())
 }
 
@@ -447,6 +510,12 @@ fn load_config() -> Result<GatewayConfig> {
     if cfg.target_peers.is_none() {
         cfg.target_peers = Some(8);
     }
+    if cfg.min_peers.is_none() {
+        cfg.min_peers = Some(4);
+    }
+    if cfg.max_peers.is_none() {
+        cfg.max_peers = Some(12);
+    }
     if cfg.redial_secs.is_none() {
         cfg.redial_secs = Some(30);
     }
@@ -461,6 +530,25 @@ fn load_config() -> Result<GatewayConfig> {
     }
     if cfg.metrics_bind.is_none() {
         cfg.metrics_bind = Some("0.0.0.0:9090".into());
+    }
+    if cfg.manifest_grace_secs.is_none() {
+        cfg.manifest_grace_secs = Some(300);
+    }
+    if cfg.forward_max_streams.is_none() {
+        cfg.forward_max_streams = Some(200);
+    }
+    if cfg.forward_wait_timeout_secs.is_none() {
+        cfg.forward_wait_timeout_secs = Some(1);
+    }
+    if cfg.forward_connect_timeout_secs.is_none() {
+        cfg.forward_connect_timeout_secs = Some(2);
+    }
+    cfg.forward_rules = Some(load_forward_rules(cfg.forward_rules.clone())?);
+    if let Some(rules) = &cfg.forward_rules {
+        info!("forward_rules_count={}", rules.len());
+        for r in rules {
+            info!("forward_rule protocol={} backend={}", r.protocol, r.backend);
+        }
     }
     Ok(cfg)
 }
@@ -515,6 +603,7 @@ struct Metrics {
     dial_attempt: IntCounter,
     dial_success: IntCounter,
     ping_ok: IntCounter,
+    ping_fail: IntCounter,
     connected_peers: IntGauge,
     registry: Registry,
 }
@@ -530,12 +619,14 @@ impl Metrics {
         let dial_success =
             IntCounter::new("dial_success_total", "successful dials (conn established)")?;
         let ping_ok = IntCounter::new("ping_ok_total", "ping responses received")?;
+        let ping_fail = IntCounter::new("ping_fail_total", "ping failures")?;
         let connected_peers = IntGauge::new("connected_peers", "current connected peers")?;
         registry.register(Box::new(manifest_fetch_ok.clone()))?;
         registry.register(Box::new(manifest_fetch_fail.clone()))?;
         registry.register(Box::new(dial_attempt.clone()))?;
         registry.register(Box::new(dial_success.clone()))?;
         registry.register(Box::new(ping_ok.clone()))?;
+        registry.register(Box::new(ping_fail.clone()))?;
         registry.register(Box::new(connected_peers.clone()))?;
         Ok(Self {
             manifest_fetch_ok,
@@ -543,6 +634,7 @@ impl Metrics {
             dial_attempt,
             dial_success,
             ping_ok,
+            ping_fail,
             connected_peers,
             registry,
         })
@@ -551,7 +643,8 @@ impl Metrics {
     fn render(&self) -> Result<String> {
         let encoder = TextEncoder::new();
         let mut buf = Vec::new();
-        let mf = self.registry.gather();
+        let mut mf = self.registry.gather();
+        mf.extend(forwarding::metrics::global_forward_metrics().gather());
         encoder.encode(&mf, &mut buf)?;
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
@@ -582,31 +675,45 @@ async fn serve_metrics(metrics: Metrics, addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-fn load_manifest_verifiers(
+struct ManifestKeys {
+    by_id: HashMap<String, VerifyingKey>,
+    fallback: Vec<VerifyingKey>,
+}
+
+fn load_manifest_keys(
+    map: Option<&HashMap<String, String>>,
     list: Option<&Vec<String>>,
     single: Option<&str>,
-) -> Result<Vec<VerifyingKey>> {
-    let mut out = Vec::new();
+) -> Result<ManifestKeys> {
+    let mut by_id = HashMap::new();
+    if let Some(map) = map {
+        for (kid, b64) in map {
+            if let Ok(vk) = decode_vk(b64) {
+                by_id.insert(kid.clone(), vk);
+            }
+        }
+    }
+    let mut fallback = Vec::new();
     if let Some(list) = list {
         for b64 in list {
             if let Ok(vk) = decode_vk(b64) {
-                out.push(vk);
+                fallback.push(vk);
             }
         }
     }
-    if out.is_empty() {
+    if fallback.is_empty() {
         if let Some(one) = single {
             if let Ok(vk) = decode_vk(one) {
-                out.push(vk);
+                fallback.push(vk);
             }
         }
     }
-    if out.is_empty() {
+    if by_id.is_empty() && fallback.is_empty() {
         warn!(
-            "manifest verification disabled: no manifest_pubkeys_b64/manifest_pubkey_b64 provided"
+            "manifest verification disabled: no manifest_trusted_keys / manifest_pubkeys_b64 / manifest_pubkey_b64 provided"
         );
     }
-    Ok(out)
+    Ok(ManifestKeys { by_id, fallback })
 }
 
 fn decode_vk(b64: &str) -> Result<VerifyingKey> {
@@ -621,8 +728,8 @@ fn decode_vk(b64: &str) -> Result<VerifyingKey> {
     Ok(key)
 }
 
-fn verify_manifest(m: &manifest::Manifest, vks: &[VerifyingKey]) -> Result<()> {
-    if vks.is_empty() {
+fn verify_manifest(m: &manifest::Manifest, keys: &ManifestKeys) -> Result<()> {
+    if keys.by_id.is_empty() && keys.fallback.is_empty() {
         return Ok(());
     }
     let unsigned = m.unsigned();
@@ -637,15 +744,20 @@ fn verify_manifest(m: &manifest::Manifest, vks: &[VerifyingKey]) -> Result<()> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("manifest signature must be 64 bytes"))?;
     let sig = Signature::from_bytes(&sig_bytes);
-    let mut verified = false;
-    for vk in vks {
-        if vk.verify_strict(&canon, &sig).is_ok() {
-            verified = true;
-            break;
+    if let Some(vk) = keys.by_id.get(&m.signing_key_id) {
+        vk.verify_strict(&canon, &sig)
+            .context("manifest signature verify failed (kid match)")?;
+    } else {
+        let mut verified = false;
+        for vk in keys.fallback.iter() {
+            if vk.verify_strict(&canon, &sig).is_ok() {
+                verified = true;
+                break;
+            }
         }
-    }
-    if !verified {
-        anyhow::bail!("manifest signature verify failed");
+        if !verified {
+            anyhow::bail!("manifest signature verify failed");
+        }
     }
     let now = OffsetDateTime::now_utc();
     if let Ok(exp) = OffsetDateTime::parse(&m.expires_at, &Rfc3339) {
@@ -654,4 +766,34 @@ fn verify_manifest(m: &manifest::Manifest, vks: &[VerifyingKey]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct ManifestCache {
+    current: Option<manifest::Manifest>,
+    previous: Option<manifest::Manifest>,
+}
+
+impl ManifestCache {
+    fn push(&mut self, m: manifest::Manifest) {
+        if let Some(cur) = self.current.take() {
+            self.previous = Some(cur);
+        }
+        self.current = Some(m);
+    }
+
+    fn last_good(&self, grace_secs: u64) -> Option<manifest::Manifest> {
+        let now = OffsetDateTime::now_utc();
+        let grace = Duration::from_secs(grace_secs);
+        for candidate in [&self.current, &self.previous] {
+            if let Some(man) = candidate {
+                if let Ok(exp) = OffsetDateTime::parse(&man.expires_at, &Rfc3339) {
+                    if exp + grace >= now {
+                        return Some(man.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
 }

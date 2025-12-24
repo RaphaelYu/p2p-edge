@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 pub mod health;
 pub mod manifest;
+pub mod metrics;
 pub mod prober;
 pub mod registry;
 pub mod signer;

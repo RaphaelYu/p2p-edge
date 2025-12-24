@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Manifest {
     pub version: String,
     pub epoch: u64,
@@ -23,7 +23,7 @@ pub struct ManifestPeer {
     pub weight: Option<u16>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UnsignedManifest {
     pub version: String,
     pub epoch: u64,

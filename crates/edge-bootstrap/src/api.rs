@@ -2,6 +2,7 @@ use crate::auth::{OperatorTokens, parse_bearer};
 use crate::challenge::{ChallengeError, ChallengeManager};
 use crate::health::health;
 use crate::manifest::ManifestService;
+use crate::metrics::{GLOBAL_METRICS, Metrics};
 use crate::registry::{NodeStatus, RegistryStore};
 use axum::{
     Json, Router,
@@ -29,6 +30,7 @@ pub struct AppState {
     pub tokens: OperatorTokens,
     pub admin_tokens: OperatorTokens,
     pub rate_limiter: RateLimiter,
+    pub metrics: Metrics,
 }
 
 #[derive(Clone)]
@@ -78,6 +80,7 @@ impl RateLimiter {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
+        .route("/metrics", get(|| async { GLOBAL_METRICS.render() }))
         .route("/bootstrap/manifest", get(manifest_handler))
         .route("/registry/challenge", post(issue_challenge))
         .route("/registry/enroll", post(enroll_node))
@@ -259,6 +262,8 @@ async fn enroll_node(
         peer_id: payload.peer_id,
         operator_id,
     };
+    GLOBAL_METRICS.registry_enroll.inc();
+    update_node_gauges(&state.registry);
     (StatusCode::OK, Json(response)).into_response()
 }
 
@@ -294,12 +299,16 @@ async fn approve_node(
         &actor,
         payload.reason.clone(),
     ) {
-        Ok(_) => Json(StatusChangeResponse {
-            status: "Active".to_string(),
-            peer_id: payload.peer_id,
-            actor,
-        })
-        .into_response(),
+        Ok(_) => {
+            GLOBAL_METRICS.registry_approve.inc();
+            update_node_gauges(&state.registry);
+            Json(StatusChangeResponse {
+                status: "Active".to_string(),
+                peer_id: payload.peer_id,
+                actor,
+            })
+            .into_response()
+        }
         Err(e) => error_response(
             StatusCode::BAD_REQUEST,
             &format!("status_change_failed: {e}"),
@@ -356,12 +365,16 @@ async fn revoke_node(
         &actor,
         payload.reason.clone(),
     ) {
-        Ok(_) => Json(StatusChangeResponse {
-            status: "Revoked".to_string(),
-            peer_id: payload.peer_id,
-            actor,
-        })
-        .into_response(),
+        Ok(_) => {
+            GLOBAL_METRICS.registry_revoke.inc();
+            update_node_gauges(&state.registry);
+            Json(StatusChangeResponse {
+                status: "Revoked".to_string(),
+                peer_id: payload.peer_id,
+                actor,
+            })
+            .into_response()
+        }
         Err(e) => error_response(
             StatusCode::BAD_REQUEST,
             &format!("status_change_failed: {e}"),
@@ -463,6 +476,15 @@ fn authenticate(headers: &HeaderMap, tokens: &OperatorTokens) -> Result<String, 
             status: StatusCode::UNAUTHORIZED,
             message: "invalid_token",
         })
+    }
+}
+
+fn update_node_gauges(registry: &RegistryStore) {
+    if let Ok(active) = registry.list_by_status(Some(NodeStatus::Active)) {
+        GLOBAL_METRICS.active_nodes.set(active.len() as i64);
+    }
+    if let Ok(pending) = registry.list_by_status(Some(NodeStatus::Pending)) {
+        GLOBAL_METRICS.pending_nodes.set(pending.len() as i64);
     }
 }
 
